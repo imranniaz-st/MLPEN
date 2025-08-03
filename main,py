@@ -1,0 +1,178 @@
+import os
+import json
+import re
+import torch
+import datetime
+from pathlib import Path
+from tqdm import tqdm
+from transformers import RobertaTokenizer, RobertaForMaskedLM, pipeline
+
+# =====================[ CONFIGURATION ]=====================
+
+BASE_DIR = "."  # 📁 Folder to scan
+EXTENSIONS = [".js"]
+LOG_FILE = "codebert_advanced_scan_log.json"
+CONFIDENCE_THRESHOLD = 0.35
+VERBOSE = True
+
+# =====================[ LOAD CODEBERT MODEL ]=====================
+
+print("[*] Loading CodeBERT model...")
+tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base-mlm")
+model = RobertaForMaskedLM.from_pretrained("microsoft/codebert-base-mlm")
+
+fill_mask = pipeline(
+    "fill-mask",
+    model=model,
+    tokenizer=tokenizer,
+    top_k=5,
+    device=0 if torch.cuda.is_available() else -1
+)
+
+# =====================[ SUSPICIOUS PATTERNS ]=====================
+
+SUSPICIOUS_KEYWORDS = [
+    "key", "token", "secret", "password", "passwd", "auth", "bearer","sentry_key", "sentry_secret", 
+    "document.cookie", "localStorage", "sessionStorage", "eval", "innerHTML", "atob",
+    "setTimeout(", "setInterval(", "new Function(", "XMLHttpRequest", "fetch(", "axios."
+]
+
+API_PATTERN = re.compile(r"""(?:"|')((?:\/api\/[\w\/\-\?\=\&]+)|(?:https?:\/\/[\w\-\.]+\/[\w\/\-\?\=\&]+))(?:"|')""", re.IGNORECASE)
+KEY_PATTERN = re.compile(r"""(?i)(api[_\-]?key|secret|token|auth|session)[\s:=]+['"][a-zA-Z0-9\-_]{10,}['"]""")
+
+# =====================[ HELPERS ]=====================
+
+def get_timestamp():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def read_in_chunks(file_path, max_length=512):
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        code = f.read()
+    tokens = tokenizer.encode(code)
+    chunks = [
+        tokenizer.decode(tokens[i:i + max_length])
+        for i in range(0, len(tokens), max_length)
+    ]
+    return chunks, code.splitlines()
+
+def mask_suspicious_lines(lines):
+    masked = []
+    for idx, line in enumerate(lines):
+        lowered = line.lower()
+        if any(kw in lowered for kw in SUSPICIOUS_KEYWORDS):
+            masked_line = line
+            if "==" in masked_line:
+                masked_line = masked_line.replace("==", "== <mask>")
+            else:
+                masked_line = masked_line.replace("=", "= <mask>")
+            if "<mask>" in masked_line:
+                masked.append((idx + 1, masked_line.strip()))
+    return masked
+
+def extract_api_routes_and_keys(code_text):
+    apis = API_PATTERN.findall(code_text)
+    keys = KEY_PATTERN.findall(code_text)
+    return list(set(apis)), list(set(keys))
+
+def scan_file(file_path):
+    findings = []
+    chunks, lines = read_in_chunks(file_path)
+    masked_lines = mask_suspicious_lines(lines)
+    raw_text = "\n".join(lines)
+
+    apis, keys = extract_api_routes_and_keys(raw_text)
+    if apis or keys:
+        findings.append({
+            "file": file_path,
+            "line_number": "N/A",
+            "suspicious_line": "Extracted API endpoints or secrets",
+            "apis": apis,
+            "keys": keys
+        })
+
+    for line_number, line in masked_lines:
+        try:
+            results = fill_mask(line)
+            valid_suggestions = [
+                {
+                    "suggestion": r["sequence"],
+                    "score": round(r["score"], 4)
+                }
+                for r in results if r["score"] >= CONFIDENCE_THRESHOLD
+            ]
+            if valid_suggestions:
+                findings.append({
+                    "file": file_path,
+                    "line_number": line_number,
+                    "suspicious_line": line,
+                    "suggestions": valid_suggestions
+                })
+
+        except Exception as e:
+            findings.append({
+                "file": file_path,
+                "line_number": line_number,
+                "suspicious_line": line,
+                "error": str(e)
+            })
+
+    return findings
+
+# =====================[ MAIN EXECUTION ]=====================
+
+all_js_files = [
+    os.path.join(root, file)
+    for root, _, files in os.walk(BASE_DIR)
+    for file in files
+    if Path(file).suffix in EXTENSIONS
+]
+
+print(f"[+] Found {len(all_js_files)} JS files to scan.")
+total_findings = []
+
+for js_file in tqdm(all_js_files, desc="🔍 Scanning JS files"):
+    file_findings = scan_file(js_file)
+    if file_findings:
+        total_findings.extend(file_findings)
+
+# =====================[ SAVE RESULTS ]=====================
+
+output = {
+    "scanned_at": get_timestamp(),
+    "total_files": len(all_js_files),
+    "total_findings": len(total_findings),
+    "results": total_findings
+}
+
+with open(LOG_FILE, "w", encoding="utf-8") as f:
+    json.dump(output, f, indent=4)
+
+print(f"\n✅ Scan complete! Detailed log saved to: {LOG_FILE}")
+if VERBOSE:
+    for finding in total_findings:
+        print(f"\n[!] File: {finding['file']} (Line {finding.get('line_number')})")
+        print(f"    ⚠️ Line: {finding['suspicious_line']}")
+        if "suggestions" in finding:
+            for s in finding["suggestions"]:
+                print(f"    ➤ Suggestion: {s['suggestion']}  (Score: {s['score']})")
+        if "apis" in finding:
+            for api in finding["apis"]:
+                print(f"    🌐 API Route: {api}")
+        if "keys" in finding:
+            for k in finding["keys"]:
+                print(f"    🔐 API Key Found: {k}")
+
+        if "error" in finding:
+            print(f"    ❗ Error: {finding['error']}")
+        print("-" * 60)
+# =====================[ END OF SCRIPT ]=====================
+# This script scans JavaScript files for suspicious patterns, extracts API routes and keys, and uses CodeBERT to suggest masked lines.
+# It logs findings in a JSON file and prints detailed results if verbose mode is enabled.
+# Ensure you have the necessary libraries installed: transformers, torch, tqdm.
+# Run this script in an environment with access to the specified BASE_DIR.
+# Adjust the BASE_DIR and EXTENSIONS as needed for your specific use case.
+# Make sure to handle sensitive data responsibly and avoid exposing API keys or secrets in public repositories.
+
+# =====================[ END OF SCRIPT ]=====================
+# This script is designed to be run in a Python environment with the necessary libraries installed.
+

@@ -1,0 +1,2 @@
+{"func": "const data = localStorage.getItem('apikey');", "target": 1}
+{"func": "const title = 'Welcome'; document.title = title;", "target": 0}

@@ -1,0 +1,3 @@
+{"func": "const A = 'sk-'; const B = 'abc123'; const key = A + B;", "target": 1}
+{"func": "const token = 'Bearer ' + userToken;", "target": 1}
+{"func": "function add(a, b) { return a + b; }", "target": 0}
